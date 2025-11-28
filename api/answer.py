@@ -216,7 +216,7 @@ class TikuYanxi(Tiku):
         super().__init__()
         self.name = '言溪题库'
         self.api = 'https://tk.enncy.cn/query'
-        self._token = None
+        self._token = 'e61da1bfbe7e4247b46e8c7b8945c225'
         self._token_index = 0   # token队列计数器
         self._times = 100   # 查询次数剩余, 初始化为100, 查询后校对修正
 
