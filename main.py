@@ -6,6 +6,10 @@ import time
 import sys
 import os
 import traceback
+import threading
+import queue
+import pymysql
+from multiprocessing import Pool, cpu_count
 from urllib3 import disable_warnings, exceptions
 
 from api.logger import logger
@@ -18,102 +22,105 @@ from api.notification import Notification
 disable_warnings(exceptions.InsecureRequestWarning)
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description="Samueli924/chaoxing",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    parser.add_argument(
-        "-c", "--config", type=str, default=None, help="使用配置文件运行程序"
-    )
-    parser.add_argument("-u", "--username", type=str, default=None, help="手机号账号")
-    parser.add_argument("-p", "--password", type=str, default=None, help="登录密码")
-    parser.add_argument(
-        "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
-    )
-    parser.add_argument(
-        "-s", "--speed", type=float, default=1.0, help="视频播放倍速 (默认1, 最大2)"
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        "--debug",
-        action="store_true",
-        help="启用调试模式, 输出DEBUG级别日志",
-    )
-    parser.add_argument(
-        "-a", "--notopen-action", type=str, default="retry", 
-        choices=["retry", "ask", "continue"],
-        help="遇到关闭任务点时的行为: retry-重试, ask-询问, continue-继续"
-    )
-
-    # 在解析之前捕获 -h 的行为
-    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
-        parser.print_help()
-        sys.exit(0)
-
-    return parser.parse_args()
-
-
-def load_config_from_file(config_path):
-    """从配置文件加载设置"""
-    config = configparser.ConfigParser()
-    config.read(config_path, encoding="utf8")
+class DatabaseManager:
+    """数据库管理器"""
+    def __init__(self):
+        self.config = configparser.ConfigParser()
+        self.load_config()
     
-    common_config = {}
-    tiku_config = {}
-    notification_config = {}
+    def load_config(self):
+        """加载配置文件"""
+        try:
+            self.config.read('config.ini', encoding='utf-8')
+        except Exception as e:
+            logger.error(f"配置加载失败: {str(e)}")
+            raise
     
-    # 检查并读取common节
-    if config.has_section("common"):
-        common_config = dict(config.items("common"))
-        # 处理course_list，将字符串转换为列表
-        if "course_list" in common_config and common_config["course_list"]:
-            common_config["course_list"] = common_config["course_list"].split(",")
-        # 处理speed，将字符串转换为浮点数
-        if "speed" in common_config:
-            common_config["speed"] = float(common_config["speed"])
-        # 处理notopen_action，设置默认值为retry
-        if "notopen_action" not in common_config:
-            common_config["notopen_action"] = "retry"
+    def get_db_config(self):
+        """获取数据库配置"""
+        return {
+            'host': self.config.get('database', 'host', fallback='localhost'),
+            'port': self.config.getint('database', 'port', fallback=3306),
+            'user': self.config.get('database', 'user', fallback='wk'),
+            'password': self.config.get('database', 'password', fallback='1nnT4THKNez3p8p7'),
+            'database': self.config.get('database', 'db', fallback='wk'),
+            'charset': 'utf8mb4',
+            'cursorclass': pymysql.cursors.DictCursor
+        }
+
+
+class OrderManager:
+    """订单管理器 - 用于从数据库获取任务"""
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
+        self.order_queue = queue.Queue()
+        self.fetch_interval = 30  # 获取订单间隔(秒)
+        self.max_workers = cpu_count() * 2  # 最大工作进程数
+        self.processed_orders = set()  # 已处理订单ID集合
+        self.lock = threading.Lock()  # 线程锁
     
-    # 检查并读取tiku节
-    if config.has_section("tiku"):
-        tiku_config = dict(config.items("tiku"))
-        # 处理数值类型转换
-        for key in ["delay", "cover_rate"]:
-            if key in tiku_config:
-                tiku_config[key] = float(tiku_config[key])
-
-    # 检查并读取notification节
-    if config.has_section("notification"):
-        notification_config = dict(config.items("notification"))
+    def start_fetcher(self):
+        """启动订单获取线程"""
+        def fetcher():
+            while True:
+                try:
+                    orders = self._fetch_orders()
+                    if orders:
+                        for order in orders:
+                            with self.lock:
+                                if order['oid'] not in self.processed_orders:
+                                    self.order_queue.put(order)
+                                    self.processed_orders.add(order['oid'])
+                                    logger.info(f"新订单入队列: #{order['oid']}")
+                    
+                    # 动态调整获取间隔
+                    queue_size = self.order_queue.qsize()
+                    if queue_size > 20:
+                        sleep_time = self.fetch_interval * 2
+                    elif queue_size > 10:
+                        sleep_time = self.fetch_interval * 1.5
+                    else:
+                        sleep_time = self.fetch_interval
+                    
+                    time.sleep(sleep_time)
+                except Exception as e:
+                    logger.error(f"订单获取异常: {str(e)}")
+                    time.sleep(60)
+        
+        threading.Thread(target=fetcher, daemon=True).start()
     
-    return common_config, tiku_config, notification_config
-
-
-def build_config_from_args(args):
-    """从命令行参数构建配置"""
-    common_config = {
-        "username": args.username,
-        "password": args.password,
-        "course_list": args.list.split(",") if args.list else None,
-        "speed": args.speed if args.speed else 1.0,
-        "notopen_action": args.notopen_action if args.notopen_action else "retry"
-    }
-    return common_config, {}, {}
-
-
-def init_config():
-    """初始化配置"""
-    args = parse_args()
-    
-    if args.config:
-        return load_config_from_file(args.config)
-    else:
-        return build_config_from_args(args)
+    def _fetch_orders(self):
+        """从数据库获取订单"""
+        try:
+            database_config = self.db_manager.get_db_config()
+            with pymysql.connect(**database_config) as conn:
+                with conn.cursor() as cursor:
+                    # 使用事务和行锁
+                    conn.begin()
+                    
+                    # 查询待处理订单(按oid排序保证一致性)
+                    cursor.execute("""
+                        SELECT * FROM qingka_wangke_order 
+                        WHERE dockstatus=0 AND status IN ('待处理', '补刷中')
+                        ORDER BY oid ASC
+                        LIMIT 10
+                        FOR UPDATE
+                    """)
+                    orders = cursor.fetchall()
+                    
+                    if orders:
+                        # 标记订单为处理中
+                        oids = [str(o['oid']) for o in orders]
+                        cursor.execute(f"""
+                            UPDATE qingka_wangke_order 
+                            SET status='处理中', remarks='已加入处理队列'
+                            WHERE oid IN ({','.join(oids)})
+                        """)
+                        conn.commit()
+                    return orders
+        except Exception as e:
+            logger.error(f"订单获取失败: {str(e)}")
+            return []
 
 
 class RollBackManager:
@@ -121,14 +128,14 @@ class RollBackManager:
     def __init__(self):
         self.rollback_times = 0
         self.rollback_id = ""
-
+    
     def add_times(self, id: str):
         """增加回滚次数"""
         if id == self.rollback_id and self.rollback_times == 3:
             raise MaxRollBackExceeded("回滚次数已达3次, 请手动检查学习通任务点完成情况")
         else:
             self.rollback_times += 1
-
+    
     def new_job(self, id: str):
         """设置新任务，重置回滚次数"""
         if id != self.rollback_id:
@@ -136,15 +143,11 @@ class RollBackManager:
             self.rollback_times = 0
 
 
-def init_chaoxing(common_config, tiku_config):
-    """初始化超星实例"""
-    username = common_config.get("username", "")
-    password = common_config.get("password", "")
-    
-    # 如果没有提供用户名密码，从命令行获取
-    if not username or not password:
-        username = input("请输入你的手机号, 按回车确认\n手机号:")
-        password = input("请输入你的密码, 按回车确认\n密码:")
+def init_chaoxing_from_order(order, tiku_config):
+    """从订单初始化超星实例"""
+    username = order['user']
+    password = order['pass']
+    course_list = [order['kcid']]  # 从订单中获取课程ID
     
     account = Account(username, password)
     
@@ -160,7 +163,7 @@ def init_chaoxing(common_config, tiku_config):
     # 实例化超星API
     chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=query_delay)
     
-    return chaoxing
+    return chaoxing, course_list
 
 
 def handle_not_open_chapter(notopen_action, point, tiku, RB, auto_skip_notopen=False):
@@ -177,7 +180,7 @@ def handle_not_open_chapter(notopen_action, point, tiku, RB, auto_skip_notopen=F
             return -1  # 退出标记
         RB.add_times(point["id"])
         return 0  # 重试上一章节
-        
+    
     elif notopen_action == "ask":
         # 询问模式 - 判断是否需要询问
         if not auto_skip_notopen:
@@ -192,7 +195,7 @@ def handle_not_open_chapter(notopen_action, point, tiku, RB, auto_skip_notopen=F
         else:
             logger.info(f"章节 {point['title']} 未开放，自动跳过")
             return 1, auto_skip_notopen  # 继续下一章节, 保持自动跳过状态
-            
+    
     else:  # notopen_action == "continue"
         # 继续模式，直接跳过当前章节
         logger.info(f"章节 {point['title']} 未开放，根据配置跳过此章节")
@@ -238,18 +241,13 @@ def process_chapter(chaoxing, course, point, RB, notopen_action, speed, auto_ski
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
         return 1, auto_skip_notopen  # 继续下一章节
     
-    # 随机等待，避免请求过快
-    sleep_duration = random.uniform(1, 3)
-    logger.debug(f"本次随机等待时间: {sleep_duration:.3f}s")
-    time.sleep(sleep_duration)
-    
     # 获取当前章节的所有任务点
     jobs = []
     job_info = None
     jobs, job_info = chaoxing.get_job_list(
         course["clazzId"], course["courseId"], course["cpi"], point["id"]
     )
-
+    
     # 发现未开放章节, 根据配置处理
     try:
         if job_info.get("notOpen", False):
@@ -265,7 +263,7 @@ def process_chapter(chaoxing, course, point, RB, notopen_action, speed, auto_ski
         # 遇到开放的章节，重置自动跳过状态
         auto_skip_notopen = False
         RB.new_job(point["id"])
-
+    
     except MaxRollBackExceeded:
         logger.error("回滚次数已达3次, 请手动检查学习通任务点完成情况")
         # 跳过该课程
@@ -290,12 +288,11 @@ def process_chapter(chaoxing, course, point, RB, notopen_action, speed, auto_ski
 def process_course(chaoxing, course, notopen_action, speed):
     """处理单个课程"""
     logger.info(f"开始学习课程: {course['title']}")
-    
     # 获取当前课程的所有章节
     point_list = chaoxing.get_course_point(
         course["courseId"], course["clazzId"], course["cpi"]
     )
-
+    
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
     __point_index = 0
     # 记录用户是否选择继续跳过连续的未开放任务点
@@ -305,7 +302,6 @@ def process_course(chaoxing, course, notopen_action, speed):
     
     while __point_index < len(point_list["points"]):
         point = point_list["points"][__point_index]
-        logger.debug(f"当前章节 __point_index: {__point_index}")
         
         result, auto_skip_notopen = process_chapter(
             chaoxing, course, point, RB, notopen_action, speed, auto_skip_notopen
@@ -321,83 +317,221 @@ def process_course(chaoxing, course, notopen_action, speed):
 
 def filter_courses(all_course, course_list):
     """过滤要学习的课程"""
-    if not course_list:
-        # 手动输入要学习的课程ID列表
-        print("*" * 10 + "课程列表" + "*" * 10)
-        for course in all_course:
-            print(f"ID: {course['courseId']} 课程名: {course['title']}")
-        print("*" * 28)
-        try:
-            course_list = input(
-                "请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198\n"
-            ).split(",")
-        except Exception as e:
-            raise InputFormatError("输入格式错误") from e
-
     # 筛选需要学习的课程
     course_task = []
     for course in all_course:
-        if course["courseId"] in course_list:
+        if str(course["courseId"]) in course_list:
             course_task.append(course)
     
-    # 如果没有指定课程，则学习所有课程
+    # 如果没有匹配的课程，则学习所有课程
     if not course_task:
         course_task = all_course
     
     return course_task
 
 
+def update_order_status(db_manager, oid, status, remarks, process=None):
+    """更新订单状态"""
+    try:
+        with pymysql.connect(**db_manager.get_db_config()) as conn:
+            with conn.cursor() as cursor:
+                if process is not None:
+                    sql = """UPDATE qingka_wangke_order
+                            SET status=%s, remarks=%s, process=%s
+                            WHERE oid=%s"""
+                    cursor.execute(sql, (status, remarks, process, oid))
+                else:
+                    sql = """UPDATE qingka_wangke_order 
+                            SET status=%s, remarks=%s
+                            WHERE oid=%s"""
+                    cursor.execute(sql, (status, remarks, oid))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"状态更新失败: {str(e)}")
+
+
+def process_order(order, common_config, tiku_config, notification_config, db_manager):
+    """处理单个订单"""
+    oid = order['oid']
+    logger.info(f"开始处理订单 #{oid}")
+    max_retries = 3
+    
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            logger.info(f"重试处理订单 #{oid} (尝试 {attempt}/{max_retries})")
+            update_order_status(db_manager, oid, '补刷中', f'第 {attempt} 次尝试处理')
+            time.sleep(10)  # 重试前等待一段时间
+        
+        try:
+            # 从订单获取配置
+            speed = min(2.0, max(1.0, common_config.get("speed", 1.0)))
+            notopen_action = common_config.get("notopen_action", "retry")
+            
+            # 初始化超星实例
+            update_order_status(db_manager, oid, '处理中', '初始化超星实例', '0%')
+            chaoxing, course_list = init_chaoxing_from_order(order, tiku_config)
+            
+            # 设置外部通知
+            notification = Notification()
+            notification.config_set(notification_config)
+            notification = notification.get_notification_from_config()
+            notification.init_notification()
+            
+            # 检查当前登录状态
+            update_order_status(db_manager, oid, '处理中', '正在登录', '10%')
+            _login_state = chaoxing.login()
+            if not _login_state["status"]:
+                raise LoginError(_login_state["msg"])
+            
+            # 获取所有的课程列表
+            all_course = chaoxing.get_course_list()
+            
+            # 过滤要学习的课程
+            update_order_status(db_manager, oid, '处理中', '筛选课程', '20%')
+            course_task = filter_courses(all_course, course_list)
+            
+            if not course_task:
+                update_order_status(db_manager, oid, '已完成', '没有找到指定的课程', '100%')
+                logger.info(f"订单 #{oid} 没有找到指定的课程")
+                return True
+            
+            # 开始学习
+            logger.info(f"订单 #{oid} 课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+            
+            total_courses = len(course_task)
+            for idx, course in enumerate(course_task):
+                process_percent = 20 + int((idx / total_courses) * 80)
+                update_order_status(db_manager, oid, '处理中', 
+                                   f'正在学习课程: {course["title"]}', 
+                                   f'{process_percent}%')
+                
+                process_course(chaoxing, course, notopen_action, speed)
+            
+            update_order_status(db_manager, oid, '已完成', '所有课程学习任务已完成', '100%')
+            logger.info(f"订单 #{oid} 所有课程学习任务已完成")
+            
+            try:
+                notification.send(f"chaoxing : 订单 #{oid} 所有课程学习任务已完成")
+            except Exception:
+                pass  # 如果通知发送失败，忽略异常
+            
+            return True  # 成功完成
+        
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"订单 #{oid} 尝试 {attempt} 失败: {error_msg}")
+            
+            if attempt < max_retries:
+                continue  # 继续下一次重试
+            else:
+                # 所有重试都失败
+                update_order_status(db_manager, oid, '失败', 
+                                   f'错误: {error_msg}，已重试 {max_retries} 次')
+                return False
+
+
+def load_config_from_file(config_path):
+    """从配置文件加载设置"""
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf8")
+    
+    common_config = {}
+    tiku_config = {}
+    notification_config = {}
+    
+    # 检查并读取common节
+    if config.has_section("common"):
+        common_config = dict(config.items("common"))
+        # 处理speed，将字符串转换为浮点数
+        if "speed" in common_config:
+            common_config["speed"] = float(common_config["speed"])
+        # 处理notopen_action，设置默认值为retry
+        if "notopen_action" not in common_config:
+            common_config["notopen_action"] = "retry"
+    
+    # 检查并读取tiku节
+    if config.has_section("tiku"):
+        tiku_config = dict(config.items("tiku"))
+        # 处理数值类型转换
+        for key in ["delay", "cover_rate"]:
+            if key in tiku_config:
+                tiku_config[key] = float(tiku_config[key])
+    
+    # 检查并读取notification节
+    if config.has_section("notification"):
+        notification_config = dict(config.items("notification"))
+    
+    return common_config, tiku_config, notification_config
+
+
 def main():
     """主程序入口"""
     try:
-        # 初始化配置
-        common_config, tiku_config, notification_config = init_config()
+        # 创建默认配置文件（如果不存在）
+        if not os.path.exists('config.ini'):
+            config = configparser.ConfigParser()
+            config.add_section('database')
+            config.set('database', 'host', 'localhost')
+            config.set('database', 'port', '3306')
+            config.set('database', 'user', 'iwk_asia')
+            config.set('database', 'password', '1nnT4THKNez3p8p7')
+            config.set('database', 'db', 'iwk_asia')
+            
+            config.add_section('common')
+            config.set('common', 'speed', '1.0')
+            config.set('common', 'notopen_action', 'retry')
+            
+            with open('config.ini', 'w', encoding='utf-8') as f:
+                config.write(f)
+            logger.info("已创建默认配置文件 config.ini")
         
-        # 规范化播放速度
-        speed = min(2.0, max(1.0, common_config.get("speed", 1.0)))
-        notopen_action = common_config.get("notopen_action", "retry")
+        # 加载配置
+        common_config, tiku_config, notification_config = load_config_from_file('config.ini')
         
-        # 初始化超星实例
-        chaoxing = init_chaoxing(common_config, tiku_config)
+        # 初始化数据库管理器
+        db_manager = DatabaseManager()
         
-        # 设置外部通知
-        notification = Notification()
-        notification.config_set(notification_config)
-        notification = notification.get_notification_from_config()
-        notification.init_notification()
+        # 初始化订单管理器
+        order_manager = OrderManager(db_manager)
         
-        # 检查当前登录状态
-        _login_state = chaoxing.login()
-        if not _login_state["status"]:
-            raise LoginError(_login_state["msg"])
+        # 启动订单获取线程
+        order_manager.start_fetcher()
         
-        # 获取所有的课程列表
-        all_course = chaoxing.get_course_list()
+        logger.info("超星多账号自动化处理系统已启动")
+        logger.info(f"最大工作进程数: {order_manager.max_workers}")
         
-        # 过滤要学习的课程
-        course_task = filter_courses(all_course, common_config.get("course_list"))
-        
-        # 开始学习
-        logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
-        for course in course_task:
-            process_course(chaoxing, course, notopen_action, speed)
-        
-        logger.info("所有课程学习任务已完成")
-        notification.send("chaoxing : 所有课程学习任务已完成")
-        
+        # 启动工作进程池
+        with Pool(processes=order_manager.max_workers) as pool:
+            while True:
+                try:
+                    if not order_manager.order_queue.empty():
+                        order = order_manager.order_queue.get()
+                        
+                        # 使用进程池异步处理订单
+                        pool.apply_async(
+                            process_order,
+                            args=(order, common_config, tiku_config, notification_config, db_manager),
+                            error_callback=lambda e: logger.error(f"工作进程异常: {str(e)}")
+                        )
+                    else:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("程序被用户中断，正在退出...")
+                    break
+                except Exception as e:
+                    logger.error(f"主程序异常: {str(e)}")
+                    time.sleep(5)
+    
     except SystemExit as e:
         if e.code != 0:
             logger.error(f"错误: 程序异常退出, 返回码: {e.code}")
         sys.exit(e.code)
-    except KeyboardInterrupt as e:
-        logger.error(f"错误: 程序被用户手动中断, {e}")
+    except KeyboardInterrupt:
+        logger.info("程序被用户手动中断")
+        sys.exit(0)
     except BaseException as e:
         logger.error(f"错误: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
-        try:
-            notification.send(f"chaoxing : 出现错误 {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        except Exception:
-            pass  # 如果通知发送失败，忽略异常
         raise e
 
 
