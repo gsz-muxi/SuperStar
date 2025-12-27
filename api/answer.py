@@ -22,7 +22,7 @@ class CacheDAO:
     @Author: SocialSisterYi
     @Reference: https://github.com/SocialSisterYi/xuexiaoyi-to-xuexitong-tampermonkey-proxy
     """
-    DEFAULT_CACHE_FILE = "cache.json"
+    DEFAULT_CACHE_FILE = "cache1.json"
 
     def __init__(self, file: str = DEFAULT_CACHE_FILE):
         self.cache_file = Path(file)
@@ -105,13 +105,7 @@ class Tiku:
         
     def _init_tiku(self):
         # 仅用于题库初始化, 例如配置token, 交由自定义题库完成
-        def __init__(self) -> None:
-            super().__init__()
-            self.name = '言溪题库'
-            self.api = 'https://tk.enncy.cn/query'
-            self._token = 'e61da1bfbe7e4247b46e8c7b8945c225'
-            self._token_index = 0   # token队列计数器
-            self._times = 100   # 查询次数剩余, 初始化为100, 查询后校对修正
+        pass
 
     def config_set(self,config):
         self._conf = config
@@ -133,10 +127,10 @@ class Tiku:
             return None
 
         # 预处理, 去除【单选题】这样与标题无关的字段
-        logger.debug(f"原始标题：{q_info['title']}")
+        # logger.debug(f"原始标题：{q_info['title']}")
         q_info['title'] = sub(r'^\d+', '', q_info['title'])
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
-        logger.debug(f"处理后标题：{q_info['title']}")
+        # logger.debug(f"处理后标题：{q_info['title']}")
 
         # 先过缓存
         cache_dao = CacheDAO()
@@ -222,7 +216,7 @@ class TikuYanxi(Tiku):
         super().__init__()
         self.name = '言溪题库'
         self.api = 'https://tk.enncy.cn/query'
-        self._token = 'e61da1bfbe7e4247b46e8c7b8945c225'
+        self._token = None
         self._token_index = 0   # token队列计数器
         self._times = 100   # 查询次数剩余, 初始化为100, 查询后校对修正
 
@@ -230,8 +224,7 @@ class TikuYanxi(Tiku):
         res = requests.get(
             self.api,
             params={
-                'question':q_info['title'],
-                'token': self._token,
+                'question':q_info['title']
                 # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
                 # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
             },
@@ -254,6 +247,37 @@ class TikuYanxi(Tiku):
         else:
             logger.error(f'{self.name}查询失败:\n{res.text}')
         return None
+class zetiku(Tiku):
+    # ze题库实现
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'ze题库'
+        self.api = 'http://81.68.213.4:8081/api/search'
+        self._token = None
+        self._token_index = 0   # token队列计数器
+        self._times = 100   # 查询次数剩余, 初始化为100, 查询后校对修正
+
+    def _query(self,q_info:dict):
+        res = requests.get(
+            self.api,
+            params={
+                'title':q_info['title'],
+                # 'token': self._token,
+                'type':q_info['type'], 
+                'options':q_info['options'],
+                # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
+            },
+            verify=False
+        )
+        if res.status_code == 200:
+            res_json = res.json()
+
+            return res_json['answer'].strip()
+        else:
+            logger.error(f'{self.name}查询失败:\n{res.text}')
+        return None
+
+
     
     def load_token(self): 
         token_list = self._conf['tokens'].split(',')
@@ -308,16 +332,17 @@ class TikuLike(Tiku):
             params = api_params_map.get(q_type, "")
             tans = res_json['data'].get(params, "")
             ans = ""
-            if q_type == 1:
-                for i in tans:
-                    ans = ans + q_info['options'][option_map[i]] + '\n'
-            elif q_type == 2:
-                for i in tans:
-                    ans = ans + i + '\n'
-            elif q_type == 3:
-                ans = "正确" if tans == 1 else "错误"
-            elif q_type == 0:
-                ans = tans
+            match q_type:
+                case 1:
+                    for i in tans:
+                        ans = ans + q_info['options'][option_map[i]] + '\n'
+                case 2:
+                    for i in tans:
+                        ans = ans + i + '\n'
+                case 3:
+                    ans = "正确" if tans == 1 else "错误"
+                case 0:
+                    ans = tans
         else:
             logger.error(f'{self.name}查询失败:\n{res.text}')
             return None
